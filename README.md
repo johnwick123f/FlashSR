@@ -4,6 +4,7 @@ This is a tiny audio super-resolution model based on [hierspeech++](https://gith
 
 FlashSR is released under an apache-2.0 license.
 
+Model link: https://huggingface.co/YatharthS/FlashSR
 ## Usage
 Simple 1 line installation
 
