@@ -16,7 +16,7 @@ Load model
 from FastAudioSR import FASR
 from huggingface_hub import hf_hub_download
 
-file_path = hf_hub_download(repo_id="MiraTTS/MiraTTS", filename="decoders/upsampler.pth", local_dir=".")
+file_path = hf_hub_download(repo_id="YatharthS/FlashSR", filename="upsampler.pth", local_dir=".")
 upsampler = FASR(file_path)
 ```
 
