@@ -1,6 +1,6 @@
 # FlashSR
 
-This is a tiny audio super-resolution model based on [hierspeech++](https://github.com/sh-lee-prml/HierSpeechpp) that upscales 16khz audio into much clearer 48khz audio at speed over 200x realtime or faster!
+This is a tiny audio super-resolution model based on [hierspeech++](https://github.com/sh-lee-prml/HierSpeechpp) that upscales 16khz audio into much clearer 48khz audio at speed over 200x realtime to 400x realtime!
 
 FlashSR is released under an apache-2.0 license.
 
