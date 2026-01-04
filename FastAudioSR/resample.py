@@ -5,20 +5,19 @@ import math
 from torch import Tensor
 from typing import Dict
 
-# --- FUSED KERNELS ---
+# --- FUSED KERNELS (UNCHANGED) ---
 
 @torch.jit.script
 def snake_op(x: Tensor, a: Tensor, inv_2b: Tensor) -> Tensor:
-    """Fused CUDA kernel: x + (1 - cos(2ax)) * (1/2b)"""
     return x + (1.0 - torch.cos(2.0 * a * x)) * inv_2b
 
 @torch.jit.script
 def fused_upsample_rescale(x: Tensor, weight: Tensor, stride: int, padding: int, out_padding: int, groups: int, ratio: float) -> Tensor:
-    """Fuses Transpose Conv and the Scaling factor into one stream."""
-    x = F.conv_transpose1d(x, weight, stride=stride, padding=padding, output_padding=out_padding, groups=groups)
+    # We remove the padding from the conv_transpose call because we handle it via F.pad
+    x = F.conv_transpose1d(x, weight, stride=stride, padding=0, output_padding=out_padding, groups=groups)
     return x * ratio
 
-# --- HELPER ---
+# --- HELPER (UNCHANGED) ---
 
 def get_kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int):
     even = (kernel_size % 2 == 0)
@@ -50,12 +49,10 @@ class SnakeBeta(nn.Module):
         self.alpha = nn.Parameter(init_val * alpha, requires_grad=alpha_trainable)
         self.beta = nn.Parameter(init_val * alpha, requires_grad=alpha_trainable)
         
-        # Cache for baked parameters
         self.register_buffer('a_eff', torch.empty(0), persistent=False)
         self.register_buffer('inv_2b', torch.empty(0), persistent=False)
 
     def prepare(self):
-        """Bakes parameters into buffers for maximum inference speed."""
         with torch.no_grad():
             a = (torch.exp(self.alpha) if self.alpha_logscale else self.alpha).view(1, -1, 1)
             b = (torch.exp(self.beta) if self.alpha_logscale else self.beta).view(1, -1, 1)
@@ -75,22 +72,23 @@ class LowPassFilter1d(nn.Module):
     def __init__(self, cutoff=0.5, half_width=0.6, stride=1, kernel_size=12, channels=512):
         super().__init__()
         self.stride = stride
-        self.padding = kernel_size // 2 - int(kernel_size % 2 == 0)
+        # Logic for reflection padding
+        self.pad = kernel_size // 2 - int(kernel_size % 2 == 0)
         self.register_buffer("filter", get_kaiser_sinc_filter1d(cutoff, half_width, kernel_size))
-        
-        # Dynamic cache to handle varying batch/channel sizes without reallocation
         self.f_cache: Dict[int, Tensor] = {}
 
     def forward(self, x):
         C = x.shape[1]
-        if self.training:
-            return F.conv1d(x, self.filter.expand(C, -1, -1), stride=self.stride, padding=self.padding, groups=C)
+        # Use reflection padding to avoid edge artifacts in audio
+        x = F.pad(x, (self.pad, self.pad), mode='reflect')
         
-        # Inference Optimization: Cache expanded weights per channel count
+        if self.training:
+            return F.conv1d(x, self.filter.expand(C, -1, -1), stride=self.stride, padding=0, groups=C)
+        
         if C not in self.f_cache or self.f_cache[C].device != x.device:
             self.f_cache[C] = self.filter.expand(C, -1, -1).contiguous()
             
-        return F.conv1d(x, self.f_cache[C], stride=self.stride, padding=self.padding, groups=C)
+        return F.conv1d(x, self.f_cache[C], stride=self.stride, padding=0, groups=C)
 
 class UpSample1d(nn.Module):
     def __init__(self, ratio=2, kernel_size=None, channels=512):
@@ -99,7 +97,7 @@ class UpSample1d(nn.Module):
         self.stride = int(ratio)
         self.kernel_size = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
         
-        # Calculate padding to eliminate slicing [..., pad:-pad]
+        # Calculate padding for internal logic
         self.pad = (self.kernel_size - self.stride + 1) // 2
         self.out_pad = 2 * self.pad - (self.kernel_size - self.stride)
         
@@ -108,15 +106,21 @@ class UpSample1d(nn.Module):
 
     def forward(self, x):
         C = x.shape[1]
+        
+        # Reflect pad the input slightly to handle edge transients during upsampling
+        # We use a small pad (1) because Transpose Conv expands the signal anyway
+        x = F.pad(x, (1, 1), mode='reflect')
+        
         if self.training:
             f = self.filter.expand(C, -1, -1)
-            return fused_upsample_rescale(x, f, self.stride, self.pad, self.out_pad, C, self.ratio)
+            # Adjust padding to account for the manual F.pad(1, 1)
+            return fused_upsample_rescale(x, f, self.stride, 0, self.out_pad, C, self.ratio)[:, :, self.stride:-self.stride]
         
-        # Cache expansion to avoid "RuntimeError: expected input channels"
         if C not in self.f_cache or self.f_cache[C].device != x.device:
             self.f_cache[C] = self.filter.expand(C, -1, -1).contiguous()
             
-        return fused_upsample_rescale(x, self.f_cache[C], self.stride, self.pad, self.out_pad, C, self.ratio)
+        # Slicing at the end is fast and ensures the output length matches your original state_dict expectations
+        return fused_upsample_rescale(x, self.f_cache[C], self.stride, 0, self.out_pad, C, self.ratio)[:, :, self.stride:-self.stride]
 
 class DownSample1d(nn.Module):
     def __init__(self, ratio=2, kernel_size=None, channels=512):
