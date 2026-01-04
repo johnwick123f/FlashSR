@@ -3,23 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from torch import Tensor
-from typing import Dict
 
-# --- FUSED KERNELS (UNCHANGED) ---
-
+# --- MATH UTILS ---
 @torch.jit.script
-def snake_op(x: Tensor, a: Tensor, inv_2b: Tensor) -> Tensor:
-    return x + (1.0 - torch.cos(2.0 * a * x)) * inv_2b
+def sinc(x: Tensor):
+    return torch.where(x == 0, torch.ones_like(x), torch.sin(math.pi * x) / (math.pi * x))
 
-@torch.jit.script
-def fused_upsample_rescale(x: Tensor, weight: Tensor, stride: int, padding: int, out_padding: int, groups: int, ratio: float) -> Tensor:
-    # We remove the padding from the conv_transpose call because we handle it via F.pad
-    x = F.conv_transpose1d(x, weight, stride=stride, padding=0, output_padding=out_padding, groups=groups)
-    return x * ratio
-
-# --- HELPER (UNCHANGED) ---
-
-def get_kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int):
+def kaiser_sinc_filter1d(cutoff, half_width, kernel_size):
     even = (kernel_size % 2 == 0)
     half_size = kernel_size // 2
     delta_f = 4 * half_width
@@ -29,13 +19,25 @@ def get_kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int)
     else: beta = 0.
     
     window = torch.kaiser_window(kernel_size, beta=beta, periodic=False)
-    time = (torch.arange(-half_size, half_size).float() + 0.5) if even else (torch.arange(kernel_size).float() - half_size)
+    time = (torch.arange(-half_size, half_size) + 0.5) if even else (torch.arange(kernel_size) - half_size)
     
-    if cutoff == 0: return torch.zeros(1, 1, kernel_size)
-    x = 2 * cutoff * time
-    sinc = torch.where(x == 0, torch.ones_like(x), torch.sin(math.pi * x) / (math.pi * x))
-    res = 2 * cutoff * window * sinc
-    return (res / res.sum()).view(1, 1, kernel_size)
+    if cutoff == 0:
+        filter_ = torch.zeros_like(time)
+    else:
+        filter_ = 2 * cutoff * window * sinc(2 * cutoff * time)
+        filter_ /= filter_.sum()
+    return filter_.view(1, 1, kernel_size)
+
+# --- FUSED KERNELS ---
+@torch.jit.script
+def snake_fast(x: Tensor, a: Tensor, inv_2b: Tensor) -> Tensor:
+    return x + (1.0 - torch.cos(2.0 * a * x)) * inv_2b
+
+@torch.jit.script
+def fast_upsample_forward(x: Tensor, weight: Tensor, ratio: int, stride: int, pad_inner: int, pad_left: int, pad_right: int):
+    # Using 'zeros' (implicit padding) is way faster than 'replicate'
+    x = F.conv_transpose1d(x, weight, stride=stride, padding=pad_inner, groups=x.shape[1])
+    return x[..., pad_left:-pad_right] * float(ratio)
 
 # --- MODULES ---
 
@@ -43,90 +45,81 @@ class SnakeBeta(nn.Module):
     def __init__(self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False):
         super().__init__()
         self.alpha_logscale = alpha_logscale
-        self.in_features = in_features
         init_val = torch.zeros(in_features) if alpha_logscale else torch.ones(in_features)
-        
         self.alpha = nn.Parameter(init_val * alpha, requires_grad=alpha_trainable)
         self.beta = nn.Parameter(init_val * alpha, requires_grad=alpha_trainable)
         
-        self.register_buffer('a_eff', torch.empty(0), persistent=False)
-        self.register_buffer('inv_2b', torch.empty(0), persistent=False)
+        self.register_buffer('a_eff', torch.ones(1, in_features, 1), persistent=False)
+        self.register_buffer('inv_2b', torch.ones(1, in_features, 1), persistent=False)
+        self._prepared = False
 
     def prepare(self):
         with torch.no_grad():
             a = (torch.exp(self.alpha) if self.alpha_logscale else self.alpha).view(1, -1, 1)
             b = (torch.exp(self.beta) if self.alpha_logscale else self.beta).view(1, -1, 1)
-            self.a_eff = a.contiguous()
-            self.inv_2b = (1.0 / (2.0 * b + 1e-9)).contiguous()
+            self.a_eff.copy_(a)
+            self.inv_2b.copy_(1.0 / (2.0 * b + 1e-9))
+        self._prepared = True
 
     def forward(self, x):
-        if self.training:
-            a = (torch.exp(self.alpha) if self.alpha_logscale else self.alpha).view(1, -1, 1)
-            b = (torch.exp(self.beta) if self.alpha_logscale else self.beta).view(1, -1, 1)
-            return snake_op(x, a, 1.0 / (2.0 * b + 1e-9))
-        
-        if self.a_eff.numel() == 0: self.prepare()
-        return snake_op(x, self.a_eff, self.inv_2b)
+        if not self._prepared and not self.training: self.prepare()
+        if not self.training: return snake_fast(x, self.a_eff, self.inv_2b)
+        a = (torch.exp(self.alpha) if self.alpha_logscale else self.alpha).view(1, -1, 1)
+        b = (torch.exp(self.beta) if self.alpha_logscale else self.beta).view(1, -1, 1)
+        return x + (1.0 - torch.cos(2.0 * a * x)) / (2.0 * b + 1e-9)
 
 class LowPassFilter1d(nn.Module):
     def __init__(self, cutoff=0.5, half_width=0.6, stride=1, kernel_size=12, channels=512):
         super().__init__()
         self.stride = stride
-        # Logic for reflection padding
-        self.pad = kernel_size // 2 - int(kernel_size % 2 == 0)
-        self.register_buffer("filter", get_kaiser_sinc_filter1d(cutoff, half_width, kernel_size))
-        self.f_cache: Dict[int, Tensor] = {}
+        self.channels = channels
+        even = (kernel_size % 2 == 0)
+        self.padding = kernel_size // 2 - int(even) # Using implicit zero padding
+        
+        self.register_buffer("filter", kaiser_sinc_filter1d(cutoff, half_width, kernel_size))
+        self.register_buffer("f_opt", torch.zeros(channels, 1, kernel_size), persistent=False)
+        self._prepared = False
+
+    def prepare(self):
+        self.f_opt.copy_(self.filter.expand(self.channels, -1, -1))
+        self._prepared = True
 
     def forward(self, x):
+        if not self._prepared and not self.training: self.prepare()
         C = x.shape[1]
-        # Use reflection padding to avoid edge artifacts in audio
-        x = F.pad(x, (self.pad, self.pad), mode='reflect')
-        
-        if self.training:
-            return F.conv1d(x, self.filter.expand(C, -1, -1), stride=self.stride, padding=0, groups=C)
-        
-        if C not in self.f_cache or self.f_cache[C].device != x.device:
-            self.f_cache[C] = self.filter.expand(C, -1, -1).contiguous()
-            
-        return F.conv1d(x, self.f_cache[C], stride=self.stride, padding=0, groups=C)
+        f = self.f_opt[:C] if not self.training else self.filter.expand(C, -1, -1)
+        # padding=self.padding here is 'zero' padding, handled by cuDNN (fast)
+        return F.conv1d(x, f, stride=self.stride, padding=self.padding, groups=C)
 
 class UpSample1d(nn.Module):
     def __init__(self, ratio=2, kernel_size=None, channels=512):
         super().__init__()
-        self.ratio = float(ratio)
-        self.stride = int(ratio)
+        self.ratio, self.stride, self.channels = ratio, ratio, channels
         self.kernel_size = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
         
-        # Calculate padding for internal logic
-        self.pad = (self.kernel_size - self.stride + 1) // 2
-        self.out_pad = 2 * self.pad - (self.kernel_size - self.stride)
+        # Math for zero-padded transpose conv
+        self.pad_inner = 0 
+        self.pad_left = (self.kernel_size - self.stride) // 2
+        self.pad_right = (self.kernel_size - self.stride + 1) // 2
         
-        self.register_buffer("filter", get_kaiser_sinc_filter1d(0.5 / ratio, 0.6 / ratio, self.kernel_size))
-        self.f_cache: Dict[int, Tensor] = {}
+        self.register_buffer("filter", kaiser_sinc_filter1d(0.5 / ratio, 0.6 / ratio, self.kernel_size))
+        self.register_buffer("f_opt", torch.zeros(channels, 1, self.kernel_size), persistent=False)
+        self._prepared = False
+
+    def prepare(self):
+        self.f_opt.copy_(self.filter.expand(self.channels, -1, -1))
+        self._prepared = True
 
     def forward(self, x):
+        if not self._prepared and not self.training: self.prepare()
         C = x.shape[1]
-        
-        # Reflect pad the input slightly to handle edge transients during upsampling
-        # We use a small pad (1) because Transpose Conv expands the signal anyway
-        x = F.pad(x, (1, 1), mode='reflect')
-        
-        if self.training:
-            f = self.filter.expand(C, -1, -1)
-            # Adjust padding to account for the manual F.pad(1, 1)
-            return fused_upsample_rescale(x, f, self.stride, 0, self.out_pad, C, self.ratio)[:, :, self.stride:-self.stride]
-        
-        if C not in self.f_cache or self.f_cache[C].device != x.device:
-            self.f_cache[C] = self.filter.expand(C, -1, -1).contiguous()
-            
-        # Slicing at the end is fast and ensures the output length matches your original state_dict expectations
-        return fused_upsample_rescale(x, self.f_cache[C], self.stride, 0, self.out_pad, C, self.ratio)[:, :, self.stride:-self.stride]
+        f = self.f_opt[:C] if not self.training else self.filter.expand(C, -1, -1)
+        return fast_upsample_forward(x, f, self.ratio, self.stride, self.pad_inner, self.pad_left, self.pad_right)
 
 class DownSample1d(nn.Module):
     def __init__(self, ratio=2, kernel_size=None, channels=512):
         super().__init__()
-        ks = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
-        self.lowpass = LowPassFilter1d(0.5/ratio, 0.6/ratio, stride=ratio, kernel_size=ks, channels=channels)
-
-    def forward(self, x):
-        return self.lowpass(x)
+        self.lowpass = LowPassFilter1d(0.5/ratio, 0.6/ratio, stride=ratio, 
+                                       kernel_size=int(6*ratio//2)*2 if kernel_size is None else kernel_size,
+                                       channels=channels)
+    def forward(self, x): return self.lowpass(x)
