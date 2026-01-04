@@ -69,24 +69,38 @@ class LowPassFilter1d(nn.Module):
         self.stride = stride
         self.padding = padding
         self.padding_mode = padding_mode
+        self.channels = channels
         
         even = (kernel_size % 2 == 0)
         self.pad_left = kernel_size // 2 - int(even)
         self.pad_right = kernel_size // 2
 
-        # Generate filter using your existing kaiser_sinc_filter1d function
-        filt = kaiser_sinc_filter1d(cutoff, half_width, kernel_size)
+        # 1. Register the checkpoint weight as 'filter_raw'
+        # This matches the [1, 1, K] shape in your checkpoint
+        self.register_buffer("filter", kaiser_sinc_filter1d(cutoff, half_width, kernel_size))
         
-        # PRE-EXPAND: Instead of [1, 1, K], we store [C, 1, K]
-        # This makes the forward pass a direct call with no expansions
-        self.register_buffer("filter", filt.expand(channels, 1, -1))
+        # 2. Register the optimized buffer with persistent=False
+        # This makes it invisible to load_state_dict()
+        self.register_buffer("filter_optimized", torch.zeros(channels, 1, kernel_size), persistent=False)
+        self._is_prepared = False
+
+    def prepare(self):
+        """Expands the loaded weight into the optimized buffer once"""
+        with torch.no_grad():
+            # Expand [1, 1, K] -> [C, 1, K]
+            self.filter_optimized.copy_(self.filter.expand(self.channels, -1, -1))
+        self._is_prepared = True
 
     def forward(self, x):
+        if not self._is_prepared and not self.training:
+            self.prepare()
+
         if self.padding:
             x = F.pad(x, (self.pad_left, self.pad_right), mode=self.padding_mode)
-        # Groups is now pre-set by the filter shape
-        return F.conv1d(x, self.filter, stride=self.stride, groups=self.filter.shape[0])
-
+        
+        # Use the optimized pre-expanded buffer
+        f = self.filter_optimized if not self.training else self.filter.expand(x.shape[1], -1, -1)
+        return F.conv1d(x, f, stride=self.stride, groups=x.shape[1])
 
 class UpSample1d(nn.Module):
     def __init__(self, ratio=2, kernel_size=None, channels=512):
@@ -94,20 +108,29 @@ class UpSample1d(nn.Module):
         self.ratio = ratio
         self.kernel_size = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
         self.stride = ratio
+        self.channels = channels
         self.pad = self.kernel_size // ratio - 1
         self.pad_left = self.pad * self.stride + (self.kernel_size - self.stride) // 2
         self.pad_right = self.pad * self.stride + (self.kernel_size - self.stride + 1) // 2
         
-        filt = kaiser_sinc_filter1d(cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=self.kernel_size)
+        # Match checkpoint shape
+        self.register_buffer("filter", kaiser_sinc_filter1d(0.5 / ratio, 0.6 / ratio, self.kernel_size))
         
-        # Store pre-expanded filter
-        self.register_buffer("filter", filt.expand(channels, 1, -1))
+        # Optimized buffer (invisible to state_dict)
+        self.register_buffer("filter_optimized", torch.zeros(channels, 1, self.kernel_size), persistent=False)
+        self._is_prepared = False
+
+    def prepare(self):
+        with torch.no_grad():
+            self.filter_optimized.copy_(self.filter.expand(self.channels, -1, -1))
+        self._is_prepared = True
 
     def forward(self, x):
-        # Call the JIT-optimized function
-        return fast_upsample_forward(
-            x, self.filter, self.ratio, self.stride, self.pad, self.pad_left, self.pad_right
-        )
+        if not self._is_prepared and not self.training:
+            self.prepare()
+
+        f = self.filter_optimized if not self.training else self.filter.expand(x.shape[1], -1, -1)
+        return fast_upsample_forward(x, f, self.ratio, self.stride, self.pad, self.pad_left, self.pad_right)
 
 
 class DownSample1d(nn.Module):
