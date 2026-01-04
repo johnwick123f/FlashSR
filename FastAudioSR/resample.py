@@ -1,7 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import torch.sinc
 
+sinc = torch.sinc
 # Using JIT for the forward passes to fuse slicing and convs
 @torch.jit.script
 def fast_upsample_forward(x: torch.Tensor, weight: torch.Tensor, ratio: int, stride: int, pad: int, pad_left: int, pad_right: int):
@@ -10,7 +16,38 @@ def fast_upsample_forward(x: torch.Tensor, weight: torch.Tensor, ratio: int, str
     x = F.pad(x, (pad, pad), mode='replicate')
     x = F.conv_transpose1d(x, weight, stride=stride, groups=weight.shape[0])
     return x[..., pad_left:-pad_right] * float(ratio)
+    
+def kaiser_sinc_filter1d(cutoff, half_width, kernel_size): # return filter [1,1,kernel_size]
+    even = (kernel_size % 2 == 0)
+    half_size = kernel_size // 2
 
+    #For kaiser window
+    delta_f = 4 * half_width
+    A = 2.285 * (half_size - 1) * math.pi * delta_f + 7.95
+    if A > 50.:
+        beta = 0.1102 * (A - 8.7)
+    elif A >= 21.:
+        beta = 0.5842 * (A - 21)**0.4 + 0.07886 * (A - 21.)
+    else:
+        beta = 0.
+    window = torch.kaiser_window(kernel_size, beta=beta, periodic=False)
+
+    # ratio = 0.5/cutoff -> 2 * cutoff = 1 / ratio
+    if even:
+        time = (torch.arange(-half_size, half_size) + 0.5)
+    else:
+        time = torch.arange(kernel_size) - half_size
+    if cutoff == 0:
+        filter_ = torch.zeros_like(time)
+    else:
+        filter_ = 2 * cutoff * window * sinc(2 * cutoff * time)
+        # Normalize filter to have sum = 1, otherwise we will have a small leakage
+        # of the constant component in the input signal.
+        filter_ /= filter_.sum()
+        filter = filter_.view(1, 1, kernel_size)
+
+    return filter
+    
 class LowPassFilter1d(nn.Module):
     def __init__(self, cutoff=0.5, half_width=0.6, stride: int = 1, padding: bool = True, padding_mode: str = 'replicate', kernel_size: int = 12, channels: int = 512):
         super().__init__()
@@ -24,7 +61,6 @@ class LowPassFilter1d(nn.Module):
         self.pad_right = kernel_size // 2
 
         # Generate filter using your existing kaiser_sinc_filter1d function
-        from __main__ import kaiser_sinc_filter1d 
         filt = kaiser_sinc_filter1d(cutoff, half_width, kernel_size)
         
         # PRE-EXPAND: Instead of [1, 1, K], we store [C, 1, K]
