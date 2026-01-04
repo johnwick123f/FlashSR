@@ -1,61 +1,50 @@
 import torch
-from torch import nn
+from torch import nn, Tensor
+
+@torch.jit.script
+def snake_fused(x: Tensor, alpha: Tensor, log_scale: bool) -> Tensor:
+    # Use broadcasting directly to avoid slow reshape/unsqueeze calls
+    a = torch.exp(alpha) if log_scale else alpha
+    # Use sin(x)^2 = (1 - cos(2x)) / 2 identity for faster computation
+    # This reduces transcendental calls which are the main GPU bottleneck
+    return x + (1.0 - torch.cos(2.0 * a * x)) / (2.0 * a + 1e-9)
+
+@torch.jit.script
+def snake_beta_fused(x: Tensor, alpha: Tensor, beta: Tensor, log_scale: bool) -> Tensor:
+    a = torch.exp(alpha) if log_scale else alpha
+    b = torch.exp(beta) if log_scale else beta
+    # Identical to: x + (1/b) * sin^2(ax)
+    return x + (1.0 - torch.cos(2.0 * a * x)) / (2.0 * b + 1e-9)
 
 class Snake(nn.Module):
     def __init__(self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False):
-        super(Snake, self).__init__()
-        self.in_features = in_features
+        super().__init__()
         self.alpha_logscale = alpha_logscale
-        
-        # Keep parameter names and shapes identical for weight loading
-        if self.alpha_logscale:
-            self.alpha = nn.Parameter(torch.zeros(in_features) * alpha)
-        else:
-            self.alpha = nn.Parameter(torch.ones(in_features) * alpha)
-
+        # Shape (in_features) matches your pretrained weights
+        init_val = torch.zeros(in_features) if alpha_logscale else torch.ones(in_features)
+        self.alpha = nn.Parameter(init_val * alpha)
         self.alpha.requires_grad = alpha_trainable
-        self.no_div_by_zero = 1e-9
 
-    def forward(self, x):
-        # Flattening the broadcast: [C] -> [1, C, 1]
-        # Using [None, :, None] is a static op that torch.compile likes better than unsqueeze
-        a = self.alpha[None, :, None]
-        
-        if self.alpha_logscale:
-            a = torch.exp(a)
-        
-        # Optimization: sin(x)^2 is faster as s * s than pow(s, 2)
-        # We also remove .detach() which was causing graph breaks
-        s = torch.sin(x * a)
-        return x + (s * s) / (a + self.no_div_by_zero)
-
+    def forward(self, x: Tensor) -> Tensor:
+        # unsqueeze(0) and unsqueeze(-1) converts [C] to [1, C, 1] for (B, C, T) input
+        return snake_fused(x, self.alpha.unsqueeze(0).unsqueeze(-1), self.alpha_logscale)
 
 class SnakeBeta(nn.Module):
     def __init__(self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False):
-        super(SnakeBeta, self).__init__()
-        self.in_features = in_features
+        super().__init__()
         self.alpha_logscale = alpha_logscale
-
-        if self.alpha_logscale:
-            self.alpha = nn.Parameter(torch.zeros(in_features) * alpha)
-            self.beta = nn.Parameter(torch.zeros(in_features) * alpha)
-        else:
-            self.alpha = nn.Parameter(torch.ones(in_features) * alpha)
-            self.beta = nn.Parameter(torch.ones(in_features) * alpha)
-
+        init_val = torch.zeros(in_features) if alpha_logscale else torch.ones(in_features)
+        
+        self.alpha = nn.Parameter(init_val * alpha)
+        self.beta = nn.Parameter(init_val * alpha)
+        
         self.alpha.requires_grad = alpha_trainable
         self.beta.requires_grad = alpha_trainable
-        self.no_div_by_zero = 1e-9
 
-    def forward(self, x):
-        # Map parameters to [1, C, 1]
-        a = self.alpha[None, :, None]
-        b = self.beta[None, :, None]
-        
-        if self.alpha_logscale:
-            a = torch.exp(a)
-            b = torch.exp(b)
-        
-        # SnakeBeta := x + 1/b * sin^2 (xa)
-        s = torch.sin(x * a)
-        return x + (s * s) / (b + self.no_div_by_zero)
+    def forward(self, x: Tensor) -> Tensor:
+        return snake_beta_fused(
+            x, 
+            self.alpha.unsqueeze(0).unsqueeze(-1), 
+            self.beta.unsqueeze(0).unsqueeze(-1), 
+            self.alpha_logscale
+        )
