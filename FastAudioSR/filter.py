@@ -119,7 +119,19 @@ class UpSample1d(nn.Module):
 class DownSample1d(nn.Module):
     def __init__(self, ratio=2, kernel_size=None, channels=512):
         super().__init__()
-        self.lowpass = LowPassFilter1d(0.5/ratio, 0.6/ratio, stride=ratio, 
-                                       kernel_size=int(6*ratio//2)*2 if kernel_size is None else kernel_size,
-                                       channels=channels)
-    def forward(self, x): return self.lowpass(x)
+        # Internalize the lowpass filter with the optimized LowPassFilter1d class
+        self.lowpass = LowPassFilter1d(
+            cutoff=0.5 / ratio, 
+            half_width=0.6 / ratio, 
+            stride=ratio, 
+            kernel_size=int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size,
+            channels=channels
+        )
+
+    def prepare(self):
+        """Recursively prepares the internal lowpass filter"""
+        self.lowpass.prepare()
+
+    def forward(self, x):
+        # The LowPassFilter1d already handles the optimized f_opt logic
+        return self.lowpass(x)
