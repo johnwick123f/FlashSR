@@ -4,10 +4,27 @@ import torch.nn.functional as F
 import math
 from torch import Tensor
 
+# --- MATH UTILS ---
 @torch.jit.script
-def snake_fast(x: Tensor, a: Tensor, inv_2b: Tensor) -> Tensor:
-    # Fused Snake: 1 trig call, zero divisions
-    return x + (1.0 - torch.cos(2.0 * a * x)) * inv_2b
+def sinc(x: Tensor):
+    return torch.where(x == 0, torch.ones_like(x), torch.sin(math.pi * x) / (math.pi * x))
+
+def kaiser_sinc_filter1d(cutoff, half_width, kernel_size):
+    even = (kernel_size % 2 == 0)
+    half_size = kernel_size // 2
+    delta_f = 4 * half_width
+    A = 2.285 * (half_size - 1) * math.pi * delta_f + 7.95
+    if A > 50.: beta = 0.1102 * (A - 8.7)
+    elif A >= 21.: beta = 0.5842 * (A - 21)**0.4 + 0.07886 * (A - 21.)
+    else: beta = 0.
+    window = torch.kaiser_window(kernel_size, beta=beta, periodic=False)
+    time = (torch.arange(-half_size, half_size) + 0.5) if even else (torch.arange(kernel_size) - half_size)
+    if cutoff == 0:
+        filter_ = torch.zeros_like(time)
+    else:
+        filter_ = 2 * cutoff * window * sinc(2 * cutoff * time)
+        filter_ /= filter_.sum()
+    return filter_.view(1, 1, kernel_size)
 
 @torch.jit.script
 def fast_upsample_forward(x: Tensor, weight: Tensor, stride: int, pad_left: int, pad_right: int):
