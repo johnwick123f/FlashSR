@@ -1,22 +1,27 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import math
-import torch.sinc
 
-sinc = torch.sinc
-# Using JIT for the forward passes to fuse slicing and convs
-@torch.jit.script
-def fast_upsample_forward(x: torch.Tensor, weight: torch.Tensor, ratio: int, stride: int, pad: int, pad_left: int, pad_right: int):
-    # F.pad with replicate is a bottleneck. 
-    # By JITing this, we reduce the overhead of the Python wrapper.
-    x = F.pad(x, (pad, pad), mode='replicate')
-    x = F.conv_transpose1d(x, weight, stride=stride, groups=weight.shape[0])
-    return x[..., pad_left:-pad_right] * float(ratio)
-    
+if 'sinc' in dir(torch):
+    sinc = torch.sinc
+else:
+    # This code is adopted from adefossez's julius.core.sinc under the MIT License
+    # https://adefossez.github.io/julius/julius/core.html
+    #   LICENSE is in incl_licenses directory.
+    def sinc(x: torch.Tensor):
+        """
+        Implementation of sinc, i.e. sin(pi * x) / (pi * x)
+        __Warning__: Different to julius.sinc, the input is multiplied by `pi`!
+        """
+        return torch.where(x == 0,
+                           torch.tensor(1., device=x.device, dtype=x.dtype),
+                           torch.sin(math.pi * x) / math.pi / x)
+
+
+# This code is adopted from adefossez's julius.lowpass.LowPassFilters under the MIT License
+# https://adefossez.github.io/julius/julius/lowpass.html
+#   LICENSE is in incl_licenses directory.
 def kaiser_sinc_filter1d(cutoff, half_width, kernel_size): # return filter [1,1,kernel_size]
     even = (kernel_size % 2 == 0)
     half_size = kernel_size // 2
@@ -47,6 +52,15 @@ def kaiser_sinc_filter1d(cutoff, half_width, kernel_size): # return filter [1,1,
         filter = filter_.view(1, 1, kernel_size)
 
     return filter
+    
+# Using JIT for the forward passes to fuse slicing and convs
+@torch.jit.script
+def fast_upsample_forward(x: torch.Tensor, weight: torch.Tensor, ratio: int, stride: int, pad: int, pad_left: int, pad_right: int):
+    # F.pad with replicate is a bottleneck. 
+    # By JITing this, we reduce the overhead of the Python wrapper.
+    x = F.pad(x, (pad, pad), mode='replicate')
+    x = F.conv_transpose1d(x, weight, stride=stride, groups=weight.shape[0])
+    return x[..., pad_left:-pad_right] * float(ratio)
     
 class LowPassFilter1d(nn.Module):
     def __init__(self, cutoff=0.5, half_width=0.6, stride: int = 1, padding: bool = True, padding_mode: str = 'replicate', kernel_size: int = 12, channels: int = 512):
@@ -84,7 +98,6 @@ class UpSample1d(nn.Module):
         self.pad_left = self.pad * self.stride + (self.kernel_size - self.stride) // 2
         self.pad_right = self.pad * self.stride + (self.kernel_size - self.stride + 1) // 2
         
-        from __main__ import kaiser_sinc_filter1d
         filt = kaiser_sinc_filter1d(cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=self.kernel_size)
         
         # Store pre-expanded filter
