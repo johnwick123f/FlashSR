@@ -17,8 +17,10 @@ def kaiser_sinc_filter1d(cutoff, half_width, kernel_size):
     if A > 50.: beta = 0.1102 * (A - 8.7)
     elif A >= 21.: beta = 0.5842 * (A - 21)**0.4 + 0.07886 * (A - 21.)
     else: beta = 0.
+    
     window = torch.kaiser_window(kernel_size, beta=beta, periodic=False)
     time = (torch.arange(-half_size, half_size) + 0.5) if even else (torch.arange(kernel_size) - half_size)
+    
     if cutoff == 0:
         filter_ = torch.zeros_like(time)
     else:
@@ -26,57 +28,56 @@ def kaiser_sinc_filter1d(cutoff, half_width, kernel_size):
         filter_ /= filter_.sum()
     return filter_.view(1, 1, kernel_size)
 
-@torch.jit.script
-def fast_upsample_forward(x: Tensor, weight: Tensor, stride: int, pad_left: int, pad_right: int):
-    # Ratio is now INSIDE the weight, so we skip the final multiplication
-    x = F.conv_transpose1d(x, weight, stride=stride, padding=0, groups=x.shape[1])
-    return x[..., pad_left:-pad_right]
+# --- ACTIVATION MODULES ---
 
-class UpSample1d(nn.Module):
-    def __init__(self, ratio=2, kernel_size=None, channels=512):
+class LowPassFilter1d(nn.Module):
+    def __init__(self, cutoff=0.5, half_width=0.6, stride=1, kernel_size=12, channels=512):
         super().__init__()
-        self.ratio, self.stride, self.channels = ratio, ratio, channels
-        self.full_k = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
+        self.stride = stride # Strictly 1 as requested
+        self.channels = channels
+        
+        # We use a 6-tap window for speed, but keep 12 in the buffer for checkpoint compatibility
         self.target_k = 6
+        self.padding = 2 # (6 // 2 - 1) for zero-padding symmetry
         
-        self.pad_left = (self.target_k - self.stride) // 2
-        self.pad_right = (self.target_k - self.stride + 1) // 2
-        
-        # Matches checkpoint [1, 1, 12]
-        self.register_buffer("filter", kaiser_sinc_filter1d(0.5 / ratio, 0.6 / ratio, self.full_k))
-        # Pre-expanded and Pre-scaled buffer [C, 1, 6]
+        # This matches your checkpoint [1, 1, 12]
+        self.register_buffer("filter", kaiser_sinc_filter1d(cutoff, half_width, kernel_size))
+        # Optimized buffer [C, 1, 6]
         self.register_buffer("f_opt", torch.zeros(channels, 1, self.target_k), persistent=False)
         self._prepared = False
 
     def prepare(self):
         with torch.no_grad():
-            start = (self.full_k - self.target_k) // 2
-            # SLICE + EXPAND + SCALE (Folding Step 5)
-            # We multiply by ratio HERE so we don't do it in forward()
-            short_f = self.filter[:, :, start:start+self.target_k] * float(self.ratio)
+            # Slice middle 6 taps from the loaded 12-tap weights
+            # [1, 1, 12] -> [1, 1, 6]
+            short_f = self.filter[:, :, 3:9]
+            # Pre-expand to match channel groups
             self.f_opt.copy_(short_f.expand(self.channels, -1, -1))
         self._prepared = True
 
     def forward(self, x):
         if not self._prepared and not self.training: self.prepare()
-        # Metadata optimization: If C is always the same, this is very fast
         C = x.shape[1]
-        f = self.f_opt[:C] if not self.training else (self.filter[:, :, 3:9] * float(self.ratio)).expand(C, -1, -1)
-        return fast_upsample_forward(x, f, self.stride, self.pad_left, self.pad_right)
+        # Using groups=C is the fastest way to apply the same filter to every channel
+        return F.conv1d(x, self.f_opt[:C], stride=self.stride, padding=self.padding, groups=C)
 
-class LowPassFilter1d(nn.Module):
-    def __init__(self, cutoff=0.5, half_width=0.6, stride=1, kernel_size=12, channels=512):
+class UpSample1d(nn.Module):
+    """Modified to apply Kaiser smoothing at Ratio 1"""
+    def __init__(self, ratio=1, kernel_size=12, channels=512):
         super().__init__()
-        self.stride, self.channels = stride, channels
+        # We ignore the 'ratio' argument and force it to 1 for speed
+        self.stride = 1 
+        self.channels = channels
         self.target_k = 6
         
-        self.register_buffer("filter", kaiser_sinc_filter1d(cutoff, half_width, kernel_size))
+        # Load the weights the checkpoint expects (12 taps)
+        # Even if ratio=1, we use the 0.5/ratio math to match the original filter's "shape"
+        self.register_buffer("filter", kaiser_sinc_filter1d(0.5/2.0, 0.6/2.0, kernel_size))
         self.register_buffer("f_opt", torch.zeros(channels, 1, self.target_k), persistent=False)
         self._prepared = False
 
     def prepare(self):
         with torch.no_grad():
-            # Slice middle 6 taps
             short_f = self.filter[:, :, 3:9]
             self.f_opt.copy_(short_f.expand(self.channels, -1, -1))
         self._prepared = True
@@ -84,43 +85,21 @@ class LowPassFilter1d(nn.Module):
     def forward(self, x):
         if not self._prepared and not self.training: self.prepare()
         C = x.shape[1]
-        f = self.f_opt[:C] if not self.training else self.filter[:, :, 3:9].expand(C, -1, -1)
-        # padding=2 for 6-tap keeps alignment
-        return F.conv1d(x, f, stride=self.stride, padding=2, groups=C)
-
-class SnakeBeta(nn.Module):
-    def __init__(self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False):
-        super().__init__()
-        self.alpha_logscale = alpha_logscale
-        init_val = torch.zeros(in_features) if alpha_logscale else torch.ones(in_features)
-        self.alpha = nn.Parameter(init_val * alpha, requires_grad=alpha_trainable)
-        self.beta = nn.Parameter(init_val * alpha, requires_grad=alpha_trainable)
-        
-        self.register_buffer('a_eff', torch.ones(1, in_features, 1), persistent=False)
-        self.register_buffer('inv_2b', torch.ones(1, in_features, 1), persistent=False)
-        self._prepared = False
-
-    def prepare(self):
-        with torch.no_grad():
-            a = (torch.exp(self.alpha) if self.alpha_logscale else self.alpha).view(1, -1, 1)
-            b = (torch.exp(self.beta) if self.alpha_logscale else self.beta).view(1, -1, 1)
-            self.a_eff.copy_(a)
-            # Fused Scale + inv logic (Step 5 variant)
-            self.inv_2b.copy_(1.0 / (2.0 * b + 1e-9))
-        self._prepared = True
-
-    def forward(self, x):
-        if not self._prepared and not self.training: self.prepare()
-        if not self.training: return snake_fast(x, self.a_eff, self.inv_2b)
-        # Training path (slow but auto-grad friendly)
-        a = (torch.exp(self.alpha) if self.alpha_logscale else self.alpha).view(1, -1, 1)
-        b = (torch.exp(self.beta) if self.alpha_logscale else self.beta).view(1, -1, 1)
-        return x + (1.0 - torch.cos(2.0 * a * x)) / (2.0 * b + 1e-9)
+        # Standard convolution instead of transpose because ratio is 1
+        return F.conv1d(x, self.f_opt[:C], stride=self.stride, padding=2, groups=C)
 
 class DownSample1d(nn.Module):
-    def __init__(self, ratio=2, kernel_size=None, channels=512):
+    """Modified to apply Low-pass cleanup at Ratio 1"""
+    def __init__(self, ratio=1, kernel_size=12, channels=512):
         super().__init__()
-        self.lowpass = LowPassFilter1d(0.5/ratio, 0.6/ratio, stride=ratio, 
-                                       kernel_size=int(6*ratio//2)*2 if kernel_size is None else kernel_size,
-                                       channels=channels)
-    def forward(self, x): return self.lowpass(x)
+        # Force ratio 1 and reuse the LowPass logic
+        self.lowpass = LowPassFilter1d(
+            cutoff=0.5/2.0, 
+            half_width=0.6/2.0, 
+            stride=1, 
+            kernel_size=kernel_size, 
+            channels=channels
+        )
+
+    def forward(self, x):
+        return self.lowpass(x)
