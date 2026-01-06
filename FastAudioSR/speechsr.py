@@ -57,16 +57,21 @@ class AMPBlock0(torch.nn.Module):
         ])
 
     def forward(self, x):
-        acts1, acts2 = self.activations[::2], self.activations[1::2]
-        for c1, c2, a1, a2 in zip(self.convs1, self.convs2, acts1, acts2):
+    
+        # Since we pruned, zip will only iterate once
+        for c1, c2, a1, a2 in zip(self.convs1, self.convs2, 
+                                 self.activations[::2], self.activations[1::2]):
+        
             xt = a1(x)
             xt = c1(xt)
             xt = a2(xt)
             xt = c2(xt)
-            x = xt + x
 
+            # Residual connection
+            x = xt + x[:, :, :xt.shape[2]]
+        
         return x
-
+        
     def remove_weight_norm(self):
         for l in self.convs1:
             remove_weight_norm(l)
@@ -142,6 +147,7 @@ class SynthesizerTrn(nn.Module):
     def infer(self, x, max_len=None):
         o = self.dec(x[:,:,:max_len])
         return o
+
 
 
 
