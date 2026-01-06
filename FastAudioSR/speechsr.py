@@ -8,6 +8,7 @@ from einops import rearrange
 from .commons import init_weights, get_padding
 from .modules import LRELU_SLOPE
 from .activations import SnakeBeta
+from .resample import UpSample1d, DownSample1d
 
 class Activation1d(nn.Module):
     def __init__(self,
@@ -147,6 +148,7 @@ class SynthesizerTrn(nn.Module):
     def infer(self, x, max_len=None):
         o = self.dec(x[:,:,:max_len])
         return o
+
 
 
 
