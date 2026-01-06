@@ -15,11 +15,9 @@ class FASR:
             },
             "model": {
                 "resblock": "0",
-                "resblock_kernel_sizes": [3,7,11],
-                "resblock_dilation_sizes": [[1,3,5], [1,3,5], [1,3,5]],
-                "upsample_rates": [3],
+                "resblock_kernel_sizes": [11],
+                "resblock_dilation_sizes": [[1,3,5]],
                 "upsample_initial_channel": 32,
-                "upsample_kernel_sizes": [3]
             }
         }
         self.model = self._load_model(ckpt_path)
@@ -32,7 +30,9 @@ class FASR:
             **self.hps['model']
         ).to(self.device)
         assert os.path.isfile(ckpt_path)
-        checkpoint_dict = torch.load(ckpt_path, map_location='cpu')['model']
+        checkpoint_dict = torch.load(ckpt_path, map_location='cpu')
+        print(checkpoint_dict)
+        model.dec.remove_weight_norm()
         model.load_state_dict(checkpoint_dict)
         model.eval()
         return model
