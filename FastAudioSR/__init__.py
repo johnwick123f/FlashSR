@@ -31,7 +31,6 @@ class FASR:
         ).to(self.device)
         assert os.path.isfile(ckpt_path)
         checkpoint_dict = torch.load(ckpt_path, map_location='cpu')
-        print(checkpoint_dict)
         model.dec.remove_weight_norm()
         model.load_state_dict(checkpoint_dict)
         model.eval()
